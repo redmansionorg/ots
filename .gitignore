@@ -1,0 +1,18 @@
+
+---
+
+### 📄 `.gitignore`
+
+```gitignore
+# Golang
+bin/
+*.test
+*.out
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store

@@ -1,4 +1,6 @@
-# 📦 Redmansion OTS Plugin (On-chain Timestamping Consensus Module)
+# 📦 Redmansion OTS Plugin
+
+On-chain Timestamping Consensus Module
 
 This repository provides the On-chain Timestamping (OTS) consensus plugin for Redmansion Chain. It enables block-level timestamp proofs anchored to Bitcoin via OpenTimestamps, supporting decentralized copyright notarization for literature and art metadata.
 

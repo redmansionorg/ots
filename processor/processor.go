@@ -1,6 +1,20 @@
 // Copyright 2024 The RMC Authors
 // This file is part of the RMC library.
 //
+// DEPRECATED: This package is deprecated and will be removed in a future version.
+//
+// The independent trigger logic (CheckTrigger, shouldTriggerDaily, shouldTriggerFallback)
+// in this package has been replaced by consensus-driven triggering.
+//
+// New Design (as of 2026-01):
+// - All batch triggering is done by the consensus layer (BreatheBlock mechanism)
+// - The off-chain module (ots/module.go) monitors consensus state and processes batches
+// - Batch boundaries [startBlock, endBlock] are determined by consensus, not off-chain logic
+//
+// See: docs/08-01-ots-timer-processor.md for the updated design
+// See: ots/module.go for the new implementation
+// See: ots/consensus/transition.go for consensus-layer triggering
+//
 // Package processor implements the OTS batch processing logic.
 // Design reference: docs/08-01-ots-timer-processor.md
 
@@ -99,9 +113,9 @@ func (p *Processor) shouldTriggerDaily(now time.Time) bool {
 		return false
 	}
 
-	// Check if we already triggered today
-	if p.lastTriggerTime.Year() == now.Year() &&
-		p.lastTriggerTime.YearDay() == now.YearDay() {
+	// Use 23-hour cooldown to prevent double triggering when Fallback
+	// triggers shortly before Daily trigger time (e.g., 23:30 Fallback + 0:00 Daily)
+	if !p.lastTriggerTime.IsZero() && now.Sub(p.lastTriggerTime) <= 23*time.Hour {
 		return false
 	}
 
@@ -109,15 +123,12 @@ func (p *Processor) shouldTriggerDaily(now time.Time) bool {
 }
 
 // shouldTriggerFallback checks if fallback trigger condition is met
+// DEPRECATED: Fallback triggering has been removed. All triggering is now
+// done by the consensus layer (BreatheBlock mechanism).
 func (p *Processor) shouldTriggerFallback(currentBlock uint64) bool {
-	if p.lastProcessedBlock == 0 {
-		// First time, get from storage
-		// TODO: Load last processed block from storage
-		return false
-	}
-
-	blocksSinceLastProcess := currentBlock - p.lastProcessedBlock
-	return blocksSinceLastProcess >= p.config.FallbackBlocks
+	// Fallback triggering is no longer supported.
+	// All batch triggering is now done by consensus layer.
+	return false
 }
 
 // ProcessBatch creates and processes a new batch

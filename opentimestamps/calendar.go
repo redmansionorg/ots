@@ -317,6 +317,7 @@ func (c *CalendarClient) UpgradeTimestamp(ctx context.Context, ts *Timestamp) (*
 }
 
 // ComputeMerkleRoot computes a Merkle root for multiple digests
+// Uses Bitcoin-style duplication for odd number of nodes
 func ComputeMerkleRoot(digests [][32]byte) [32]byte {
 	if len(digests) == 0 {
 		return [32]byte{}
@@ -326,22 +327,22 @@ func ComputeMerkleRoot(digests [][32]byte) [32]byte {
 		return digests[0]
 	}
 
-	// Build Merkle tree
+	// Build Merkle tree (Bitcoin-style: duplicate last node if odd count)
 	level := make([][32]byte, len(digests))
 	copy(level, digests)
 
 	for len(level) > 1 {
-		nextLevel := make([][32]byte, (len(level)+1)/2)
+		// If odd number of nodes, duplicate the last one
+		if len(level)%2 == 1 {
+			level = append(level, level[len(level)-1])
+		}
+
+		nextLevel := make([][32]byte, len(level)/2)
 
 		for i := 0; i < len(level); i += 2 {
-			if i+1 < len(level) {
-				// Hash pair
-				combined := append(level[i][:], level[i+1][:]...)
-				nextLevel[i/2] = sha256.Sum256(combined)
-			} else {
-				// Odd element - promote to next level
-				nextLevel[i/2] = level[i]
-			}
+			// Hash pair
+			combined := append(level[i][:], level[i+1][:]...)
+			nextLevel[i/2] = sha256.Sum256(combined)
 		}
 
 		level = nextLevel
@@ -351,6 +352,7 @@ func ComputeMerkleRoot(digests [][32]byte) [32]byte {
 }
 
 // ComputeMerkleProof computes a Merkle proof for a digest
+// Uses Bitcoin-style duplication for odd number of nodes
 func ComputeMerkleProof(digests [][32]byte, targetIndex int) []Operation {
 	if len(digests) <= 1 || targetIndex >= len(digests) {
 		return nil
@@ -363,35 +365,34 @@ func ComputeMerkleProof(digests [][32]byte, targetIndex int) []Operation {
 	idx := targetIndex
 
 	for len(level) > 1 {
-		siblingIdx := idx ^ 1 // XOR with 1 to get sibling index
-
-		if siblingIdx < len(level) {
-			if idx%2 == 0 {
-				// Sibling is on the right - append
-				proof = append(proof, Operation{
-					Tag:      OpAppend,
-					Argument: level[siblingIdx][:],
-				})
-			} else {
-				// Sibling is on the left - prepend
-				proof = append(proof, Operation{
-					Tag:      OpPrepend,
-					Argument: level[siblingIdx][:],
-				})
-			}
-			// Add SHA256 operation after combining
-			proof = append(proof, Operation{Tag: OpSHA256})
+		// If odd number of nodes, duplicate the last one
+		if len(level)%2 == 1 {
+			level = append(level, level[len(level)-1])
 		}
 
+		siblingIdx := idx ^ 1 // XOR with 1 to get sibling index
+
+		if idx%2 == 0 {
+			// Sibling is on the right - append
+			proof = append(proof, Operation{
+				Tag:      OpAppend,
+				Argument: level[siblingIdx][:],
+			})
+		} else {
+			// Sibling is on the left - prepend
+			proof = append(proof, Operation{
+				Tag:      OpPrepend,
+				Argument: level[siblingIdx][:],
+			})
+		}
+		// Add SHA256 operation after combining
+		proof = append(proof, Operation{Tag: OpSHA256})
+
 		// Move to next level
-		nextLevel := make([][32]byte, (len(level)+1)/2)
+		nextLevel := make([][32]byte, len(level)/2)
 		for i := 0; i < len(level); i += 2 {
-			if i+1 < len(level) {
-				combined := append(level[i][:], level[i+1][:]...)
-				nextLevel[i/2] = sha256.Sum256(combined)
-			} else {
-				nextLevel[i/2] = level[i]
-			}
+			combined := append(level[i][:], level[i+1][:]...)
+			nextLevel[i/2] = sha256.Sum256(combined)
 		}
 
 		level = nextLevel

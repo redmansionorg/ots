@@ -42,10 +42,9 @@ type Config struct {
 	ContractAddress common.Address
 
 	// TriggerHour is the UTC hour for daily batch trigger (0-23)
+	// Note: This is for reference only. Actual triggering is done by consensus layer
+	// (BreatheBlock mechanism) based on block timestamps crossing this hour.
 	TriggerHour uint8
-
-	// FallbackBlocks is the number of blocks before fallback trigger
-	FallbackBlocks uint64
 
 	// Confirmations is the number of block confirmations before processing
 	Confirmations uint64
@@ -112,9 +111,8 @@ func DefaultConfig() *Config {
 		Mode:            ModeFull,
 		DataDir:         "ots",
 		ContractAddress: common.HexToAddress("0x0000000000000000000000000000000000009000"),
-		TriggerHour:     0,
-		FallbackBlocks:   28800, // ~24 hours at 3s/block
-		Confirmations:    15,
+		TriggerHour:     0, // Midnight UTC - for reference, actual trigger is consensus-driven
+		Confirmations:   15,
 		SystemTxGasLimit: 500000, // 500k gas for system transactions
 		OTS: OTSConfig{
 			BinaryPath: "ots",

@@ -24,6 +24,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/ots/consensus"
 	"github.com/ethereum/go-ethereum/ots/event"
 	"github.com/ethereum/go-ethereum/ots/hook"
 	otsmetrics "github.com/ethereum/go-ethereum/ots/metrics"
@@ -189,15 +190,16 @@ type Module struct {
 	mu sync.RWMutex
 
 	// Sub-modules
-	store     *storage.Store
-	collector *event.Collector
-	otsClient opentimestamps.ClientInterface
-	txBuilder *systx.Builder
+	store            *storage.Store
+	collector        *event.Collector
+	otsClient        opentimestamps.ClientInterface
+	txBuilder        *systx.Builder
+	consensusManager *consensus.OTSConsensusManager
 
-	// Processing state
-	lastProcessedBlock uint64
-	lastTriggerTime    time.Time
-	pendingBatches     []string // batch IDs waiting for confirmation
+	// Processing state - tracks what we've processed from consensus
+	lastProcessedBatchHash common.Hash // Hash of last processed batch from consensus
+	lastProcessedBlock     uint64      // End block of last processed batch (for metrics/status)
+	pendingBatches         []string    // batch IDs waiting for confirmation
 
 	// Metrics
 	lastAnchorTime     time.Time
@@ -323,6 +325,15 @@ func (m *Module) Config() *Config {
 // Store returns the storage instance for RPC API
 func (m *Module) Store() *storage.Store {
 	return m.store
+}
+
+// SetConsensusManager sets the consensus manager for accessing OTS consensus state.
+// This should be called after the consensus manager is initialized.
+func (m *Module) SetConsensusManager(cm *consensus.OTSConsensusManager) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.consensusManager = cm
+	log.Info("OTS: Consensus manager set")
 }
 
 // OnFinalize implements the FinalizeHook interface.
@@ -577,106 +588,117 @@ func (m *Module) runProcessor() {
 	}
 }
 
-// processOneTick performs one processing cycle
+// processOneTick performs one processing cycle.
+// This method monitors consensus state and processes batches when triggered by consensus.
+// It does NOT independently trigger batches - all triggering is done by consensus layer.
 func (m *Module) processOneTick() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Check if collector is available
-	if m.collector == nil {
-		log.Debug("OTS: Collector not yet initialized, skipping tick")
+	// Check if consensus manager is available
+	if m.consensusManager == nil {
+		log.Debug("OTS: Consensus manager not yet set, skipping tick")
 		return
 	}
 
-	// 1. Check for trigger conditions
-	shouldTrigger, triggerType := m.checkTriggerConditions()
-	if shouldTrigger {
-		// Start timing batch processing
-		defer otsmetrics.BatchProcessingTimer.UpdateSince(time.Now())
-	}
-	if !shouldTrigger {
+	// Check if OTS client is available
+	if m.otsClient == nil {
+		log.Debug("OTS: OTS client not yet initialized, skipping tick")
 		return
 	}
 
-	log.Info("OTS: Trigger condition met", "type", triggerType)
-
-	// 2. Determine block range to process
+	// Get current block hash
 	currentHeader := m.blockchain.CurrentHeader()
 	if currentHeader == nil {
-		log.Error("OTS: Cannot get current header")
+		log.Debug("OTS: Cannot get current header")
 		return
 	}
 
-	safeBlock := currentHeader.Number.Uint64()
-	if safeBlock > m.config.Confirmations {
-		safeBlock -= m.config.Confirmations
-	}
-
-	startBlock := m.lastProcessedBlock + 1
-	if startBlock > safeBlock {
-		log.Debug("OTS: No new blocks to process", "lastProcessed", m.lastProcessedBlock, "safeBlock", safeBlock)
-		return
-	}
-
-	// 3. Collect events from the block range
-	events, err := m.collector.CollectEvents(m.ctx, startBlock, safeBlock)
+	// Get OTS consensus state for current block
+	otsState, err := m.consensusManager.GetCurrentState(currentHeader.ParentHash)
 	if err != nil {
-		log.Error("OTS: Failed to collect events", "err", err, "start", startBlock, "end", safeBlock)
-		otsmetrics.IncCollectorError()
+		log.Debug("OTS: Failed to get consensus state", "err", err)
 		return
 	}
 
-	if len(events) == 0 {
-		log.Debug("OTS: No events in range", "start", startBlock, "end", safeBlock)
-		m.lastProcessedBlock = safeBlock
-		m.lastTriggerTime = time.Now()
-		otsmetrics.UpdateLastProcessedBlock(safeBlock)
+	if otsState == nil || otsState.CurrentBatch == nil {
 		return
 	}
 
-	// Record collected events
-	otsmetrics.MarkEventsCollected(len(events))
-	log.Info("OTS: Collected events", "count", len(events), "start", startBlock, "end", safeBlock)
+	batch := otsState.CurrentBatch
 
-	// 4. Extract RUIDs from events and build Merkle tree
-	ruids := make([]common.Hash, len(events))
-	for i, evt := range events {
-		ruids[i] = evt.RUID
+	// Only process if batch is in Triggered state and we haven't processed it yet
+	if batch.Status != consensus.BatchStatusTriggered {
+		return
 	}
 
-	merkleStart := time.Now()
-	rootHash := buildMerkleRoot(ruids)
-	otsmetrics.MerkleTreeBuildTimer.UpdateSince(merkleStart)
-	log.Info("OTS: Built Merkle tree", "root", rootHash.Hex(), "leaves", len(ruids))
+	// Check if we've already processed this batch (by comparing RootHash)
+	if batch.RootHash == m.lastProcessedBatchHash {
+		return
+	}
 
-	// 5. Submit to OpenTimestamps
+	// Any node with otsClient can submit to OTS calendar
+	// Duplicate submissions are harmless - OTS calendar servers handle deduplication
+	// The first validator to include OTSSubmitted tx in a block wins
+
+	// Start timing batch processing
+	defer otsmetrics.BatchProcessingTimer.UpdateSince(time.Now())
+
+	log.Info("OTS: Processing triggered batch",
+		"startBlock", batch.StartBlock,
+		"endBlock", batch.EndBlock,
+		"rootHash", batch.RootHash.Hex(),
+	)
+
+	// Use the block range and root hash from consensus - DO NOT recalculate!
+	startBlock := batch.StartBlock
+	endBlock := batch.EndBlock
+	rootHash := batch.RootHash
+
+	// Submit to OpenTimestamps using the consensus-determined root hash
 	calendarStart := time.Now()
 	proof, err := m.otsClient.Stamp(m.ctx, rootHash)
 	otsmetrics.CalendarSubmitTimer.UpdateSince(calendarStart)
 	if err != nil {
-		log.Error("OTS: Failed to submit to calendar", "err", err)
+		log.Error("OTS: Failed to submit to calendar", "err", err, "rootHash", rootHash.Hex())
 		otsmetrics.IncCalendarError()
 		return
 	}
 
-	// 6. Save batch metadata
-	batchID := fmt.Sprintf("batch-%d-%d", startBlock, safeBlock)
+	// Generate batch ID based on consensus block range
+	batchID := fmt.Sprintf("batch-%d-%d", startBlock, endBlock)
 
-	// Compute OTS digest (SHA256 of root hash for OTS submission)
+	// Compute OTS digest from proof
 	var otsDigest [32]byte
 	if len(proof) >= 32 {
 		copy(otsDigest[:], proof[:32])
 	}
 
+	// Collect RUIDs for metadata (optional, for local tracking)
+	var ruids []common.Hash
+	if m.collector != nil {
+		events, err := m.collector.CollectEvents(m.ctx, startBlock, endBlock)
+		if err != nil {
+			log.Warn("OTS: Failed to collect events for metadata", "err", err)
+		} else {
+			ruids = make([]common.Hash, len(events))
+			for i, evt := range events {
+				ruids[i] = evt.RUID
+			}
+			otsmetrics.MarkEventsCollected(len(events))
+		}
+	}
+
+	// Save batch metadata
 	batchMeta := &BatchMeta{
 		BatchID:     batchID,
 		StartBlock:  startBlock,
-		EndBlock:    safeBlock,
+		EndBlock:    endBlock,
 		RootHash:    rootHash,
 		OTSDigest:   otsDigest,
 		RUIDCount:   uint32(len(ruids)),
 		CreatedAt:   time.Now(),
-		TriggerType: triggerType,
+		TriggerType: TriggerTypeDaily, // All triggers now come from consensus (BreatheBlock)
 		EventRUIDs:  ruids,
 	}
 
@@ -703,9 +725,9 @@ func (m *Module) processOneTick() {
 		otsmetrics.IncStorageError()
 	}
 
-	// Update state
-	m.lastProcessedBlock = safeBlock
-	m.lastTriggerTime = time.Now()
+	// Update state - mark this batch as processed
+	m.lastProcessedBatchHash = rootHash
+	m.lastProcessedBlock = endBlock
 	m.pendingBatches = append(m.pendingBatches, batchID)
 	m.pendingBatchCount = len(m.pendingBatches)
 	m.totalBatchesCreated++
@@ -713,42 +735,16 @@ func (m *Module) processOneTick() {
 	// Update metrics
 	otsmetrics.IncBatchCreated(len(ruids))
 	otsmetrics.IncBatchSubmitted()
-	otsmetrics.UpdateLastProcessedBlock(safeBlock)
+	otsmetrics.UpdateLastProcessedBlock(endBlock)
 	otsmetrics.UpdatePendingBatches(m.pendingBatchCount)
 
-	log.Info("OTS: Batch created and submitted",
+	log.Info("OTS: Batch created and submitted to OTS calendar",
 		"batchID", batchID,
-		"root", rootHash.Hex(),
-		"events", len(events),
+		"rootHash", rootHash.Hex(),
+		"startBlock", startBlock,
+		"endBlock", endBlock,
+		"ruidCount", len(ruids),
 	)
-}
-
-// checkTriggerConditions checks if a batch should be triggered
-func (m *Module) checkTriggerConditions() (bool, TriggerType) {
-	now := time.Now().UTC()
-	currentHeader := m.blockchain.CurrentHeader()
-	if currentHeader == nil {
-		return false, TriggerTypeNone
-	}
-	currentBlock := currentHeader.Number.Uint64()
-
-	// Check daily trigger (at configured hour)
-	if now.Hour() == int(m.config.TriggerHour) {
-		// Only trigger once per day
-		if m.lastTriggerTime.IsZero() || now.Sub(m.lastTriggerTime) > 23*time.Hour {
-			return true, TriggerTypeDaily
-		}
-	}
-
-	// Check fallback trigger (block-based)
-	if m.config.FallbackBlocks > 0 && m.lastProcessedBlock > 0 {
-		blocksSinceLastProcess := currentBlock - m.lastProcessedBlock
-		if blocksSinceLastProcess >= m.config.FallbackBlocks {
-			return true, TriggerTypeFallback
-		}
-	}
-
-	return false, TriggerTypeNone
 }
 
 // runCalendarScanner scans for confirmed OTS proofs
@@ -974,23 +970,23 @@ func buildMerkleRoot(ruids []common.Hash) common.Hash {
 		leaves[i] = crypto.Keccak256Hash(ruid[:])
 	}
 
-	// Build tree layers
+	// Build tree layers (Bitcoin-style: duplicate last node if odd count)
 	currentLayer := leaves
 	for len(currentLayer) > 1 {
-		nextLayer := make([]common.Hash, (len(currentLayer)+1)/2)
+		// If odd number of nodes, duplicate the last one
+		if len(currentLayer)%2 == 1 {
+			currentLayer = append(currentLayer, currentLayer[len(currentLayer)-1])
+		}
+
+		nextLayer := make([]common.Hash, len(currentLayer)/2)
 		for i := 0; i < len(currentLayer); i += 2 {
-			if i+1 < len(currentLayer) {
-				// Combine two nodes: sort them first for deterministic ordering
-				left, right := currentLayer[i], currentLayer[i+1]
-				if left.Big().Cmp(right.Big()) > 0 {
-					left, right = right, left
-				}
-				combined := append(left[:], right[:]...)
-				nextLayer[i/2] = crypto.Keccak256Hash(combined)
-			} else {
-				// Odd node: promote to next layer
-				nextLayer[i/2] = currentLayer[i]
+			// Combine two nodes: sort them first for deterministic ordering
+			left, right := currentLayer[i], currentLayer[i+1]
+			if left.Big().Cmp(right.Big()) > 0 {
+				left, right = right, left
 			}
+			combined := append(left[:], right[:]...)
+			nextLayer[i/2] = crypto.Keccak256Hash(combined)
 		}
 		currentLayer = nextLayer
 	}
